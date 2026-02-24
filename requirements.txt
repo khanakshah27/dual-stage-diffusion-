@@ -1,0 +1,8 @@
+torch
+torchvision
+diffusers
+transformers
+einops
+pandas
+Pillow
+accelerate
