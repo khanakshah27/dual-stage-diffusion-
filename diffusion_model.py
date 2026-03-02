@@ -79,7 +79,7 @@ def collate_fn(batch):
     }
 
 class RegionPooler(nn.Module):
-    def __init__(self, in_channels=1280, region_dim=256):
+    def __init__(self, in_channels=1280, region_dim=256):htr00055thy
         super().__init__()
         self.proj = nn.Conv2d(in_channels, region_dim, 4, 4)
         self.norm = nn.LayerNorm(region_dim)
@@ -105,23 +105,34 @@ class RegionTextAttention(nn.Module):
         return out, weights
 
 def main():
-    CSV_PATH="/data/flickr30k/captions.csv"
-    IMAGE_ROOT="/data/flickr30k/images"
-    BATCH_SIZE=2
+    CSV_PATH = "/workspace/captions.csv"
+    IMAGE_ROOT = "/workspace/flickr30k-images"
+    BATCH_SIZE = 4         
+    EPOCHS = 5              
     LAMBDA = 0.1
-    SAVE_PATH = "controlnet_dual_stage.pt"
-    MAX_STEPS=1500 
     LR = 1e-4
+    SAVE_PATH = "controlnet_dual_stage.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     dataset = sketch_dataset(CSV_PATH, IMAGE_ROOT)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-   
+    dataloader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True
+    )
+
     diff_model = StableDiffusionPipeline.from_pretrained(
         "runwayml/stable-diffusion-v1-5",
         torch_dtype=torch.float16
     ).to(device)
+
+    diff_model.enable_xformers_memory_efficient_attention()
 
     controlnet = ControlNetModel.from_pretrained(
         "lllyasviel/sd-controlnet-scribble",
@@ -129,9 +140,8 @@ def main():
     ).to(device)
 
     diff_model.controlnet = controlnet
-    scheduler = DDIMScheduler.from_config(diff_model.scheduler.config)
+    scheduler = diff_model.scheduler
 
-    
     diff_model.unet.requires_grad_(False)
     diff_model.vae.requires_grad_(False)
     diff_model.text_encoder.requires_grad_(False)
@@ -149,81 +159,99 @@ def main():
         lr=LR
     )
 
+    scaler = torch.cuda.amp.GradScaler()
+
     tokenizer = diff_model.tokenizer
     text_encoder = diff_model.text_encoder
     vae = diff_model.vae
     unet = diff_model.unet
+    for epoch in range(EPOCHS):
 
-    gstep=0
-   for batch in dataloader:
+        epoch_diff_loss = 0
+        epoch_sem_loss = 0
 
-        if batch is None:
-            continue
-        if gstep >= MAX_STEPS:
-            break
+        for step, batch in enumerate(dataloader):
 
-        images = batch["image"].to(device, dtype=torch.float16)
-        sketches = batch["sketch"].to(device, dtype=torch.float16)
-        texts = batch["text"]
+            if batch is None:
+                continue
 
-        with torch.no_grad():
-            latents = vae.encode(images).latent_dist.sample()
-            latents = latents * 0.18215
+            images = batch["image"].to(device, dtype=torch.float16, non_blocking=True)
+            sketches = batch["sketch"].to(device, dtype=torch.float16, non_blocking=True)
+            texts = batch["text"]
 
-        noise = torch.randn_like(latents)
-        t = torch.randint(0, scheduler.num_train_timesteps, (latents.shape[0],), device=device)
-        noisy_latents = scheduler.add_noise(latents, noise, t)
+            with torch.no_grad():
+                latents = vae.encode(images).latent_dist.sample()
+                latents = latents * 0.18215
 
-        with torch.no_grad():
-            tokens = tokenizer(texts, padding=True, truncation=True, return_tensors="pt").input_ids.to(device)
-            text_embeds = text_encoder(tokens)[0]
+            noise = torch.randn_like(latents)
+            t = torch.randint(
+                0,
+                scheduler.config.num_train_timesteps,
+                (latents.shape[0],),
+                device=device
+            )
 
-        # Stage 1 — ControlNet conditioning
-        down_samples, mid_sample = controlnet(
-            noisy_latents,
-            t,
-            encoder_hidden_states=text_embeds,
-            controlnet_cond=sketches,
-            return_dict=False
-        )
+            noisy_latents = scheduler.add_noise(latents, noise, t)
 
-        noise_pred = unet(
-            noisy_latents,
-            t,
-            encoder_hidden_states=text_embeds,
-            down_block_additional_residuals=down_samples,
-            mid_block_additional_residual=mid_sample,
-        ).sample
+            with torch.no_grad():
+                tokens = tokenizer(
+                    texts,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt"
+                ).input_ids.to(device)
 
-        diffusion_loss = F.mse_loss(noise_pred, noise)
+                text_embeds = text_encoder(tokens)[0]
 
-        # Stage 2 — Region semantic alignment
-        projected_text = text_proj(text_embeds)
-        regions = region_pooler(mid_sample)
-        region_out, _ = region_attn(regions, projected_text)
+            with torch.cuda.amp.autocast():
 
-        sim = torch.einsum("brd,btd->brt", region_out, projected_text)
-        semantic_loss = -sim.max(dim=-1)[0].mean()
+                down_samples, mid_sample = controlnet(
+                    noisy_latents,
+                    t,
+                    encoder_hidden_states=text_embeds,
+                    controlnet_cond=sketches,
+                    return_dict=False
+                )
 
-        total_loss = diffusion_loss + LAMBDA * semantic_loss
+                noise_pred = unet(
+                    noisy_latents,
+                    t,
+                    encoder_hidden_states=text_embeds,
+                    down_block_additional_residuals=down_samples,
+                    mid_block_additional_residual=mid_sample,
+                ).sample
 
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+                diffusion_loss = F.mse_loss(noise_pred, noise)
 
-        if gstep % 200 == 0:
-            print(f"Step {gstep} | Diff: {diffusion_loss.item():.4f} | Sem: {semantic_loss.item():.4f}")
+                projected_text = text_proj(text_embeds)
+                regions = region_pooler(mid_sample)
+                region_out, _ = region_attn(regions, projected_text)
 
-        gstep += 1
+                sim = torch.einsum("brd,btd->brt", region_out, projected_text)
+                semantic_loss = -sim.max(dim=-1)[0].mean()
 
-    torch.save({
-        "controlnet": controlnet.state_dict(),
-        "region_pooler": region_pooler.state_dict(),
-        "region_attn": region_attn.state_dict(),
-        "text_proj": text_proj.state_dict()
-    }, SAVE_PATH)
+                total_loss = diffusion_loss + LAMBDA * semantic_loss
 
-    print("Training complete. Model saved.")
+            optimizer.zero_grad()
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_diff_loss += diffusion_loss.item()
+            epoch_sem_loss += semantic_loss.item()
+
+        print(f"\nEpoch {epoch+1}/{EPOCHS}")
+        print(f"Avg Diffusion Loss: {epoch_diff_loss/len(dataloader):.4f}")
+        print(f"Avg Semantic Loss: {epoch_sem_loss/len(dataloader):.4f}")
+
+        torch.save({
+            "controlnet": controlnet.state_dict(),
+            "region_pooler": region_pooler.state_dict(),
+            "region_attn": region_attn.state_dict(),
+            "text_proj": text_proj.state_dict()
+        }, f"checkpoint_epoch_{epoch+1}.pt")
+
+    print("Training complete.")
 
 if __name__ == "__main__":
     main()
