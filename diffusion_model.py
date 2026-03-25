@@ -13,7 +13,8 @@ import einops
 from diffusers import StableDiffusionPipeline, ControlNetModel
 from transformers import CLIPTokenizer, CLIPTextModel
 
-class sketch_dataset(Dataset):
+
+class SketchDataset(Dataset):
     def __init__(self, csv_path, image_root):
         self.data = pd.read_csv(csv_path)
         self.image_root = image_root
@@ -24,7 +25,7 @@ class sketch_dataset(Dataset):
         ])
 
     def edge_sketch(self, img):
-        gray = img.mean(dim=0, keepdim=True)             
+        gray = img.mean(dim=0, keepdim=True)
         edges = torch.abs(gray[:, :, 1:] - gray[:, :, :-1])
         edges = F.pad(edges, (0, 1, 0, 0))
         return edges
@@ -32,39 +33,40 @@ class sketch_dataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-   def __getitem__(self, idx):
-    row = self.data.iloc[idx]
-    img_path = os.path.join(self.image_root, row["image"])
-    caption = row["caption"]
+    def __getitem__(self, idx):
+        row = self.data.iloc[idx]
+        img_path = os.path.join(self.image_root, row["image"])
+        caption = row["caption"]
 
-    if not isinstance(caption, str) or len(caption.strip()) < 5:
-        return None
+        if not isinstance(caption, str) or len(caption.strip()) < 5:
+            return None
 
-    if len(caption.split()) > 50:
-        caption = " ".join(caption.split()[:50])
+        if len(caption.split()) > 50:
+            caption = " ".join(caption.split()[:50])
 
-    try:
-        img = Image.open(img_path).convert("RGB")
-    except Exception:
-        print(f"Skipping corrupted image: {img_path}")
-        return None
+        try:
+            img = Image.open(img_path).convert("RGB")
+        except Exception:
+            print(f"Skipping corrupted image: {img_path}")
+            return None
 
-    img = self.img_tf(img)
+        img = self.img_tf(img)
 
-    if torch.isnan(img).any():
-        return None
+        if torch.isnan(img).any():
+            return None
 
-    if img.std() < 0.01:
-        return None
+        if img.std() < 0.01:
+            return None
 
-    sketch = self.edge_sketch(img)
-    sketch = sketch.repeat(3, 1, 1)
+        sketch = self.edge_sketch(img)
+        sketch = sketch.repeat(3, 1, 1)
 
         return {
             "image": img,
             "sketch": sketch,
             "text": caption
         }
+
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
@@ -78,10 +80,12 @@ def collate_fn(batch):
         "text": [b["text"] for b in batch]
     }
 
+
+
 class RegionPooler(nn.Module):
-    def __init__(self, in_channels=512, region_dim=256):htr00055thy
+    def __init__(self, in_channels=512, region_dim=256):
         super().__init__()
-        self.proj = nn.Conv2d(in_channels, region_dim, 4, 4)
+        self.proj = nn.Conv2d(in_channels, region_dim, kernel_size=4, stride=4)
         self.norm = nn.LayerNorm(region_dim)
 
     def forward(self, h):
@@ -104,20 +108,23 @@ class RegionTextAttention(nn.Module):
         )
         return out, weights
 
+
 def main():
+
     CSV_PATH = "/workspace/captions.csv"
     IMAGE_ROOT = "/workspace/flickr30k-images"
-    BATCH_SIZE = 4         
-    EPOCHS = 5              
+
+    BATCH_SIZE = 4
+    EPOCHS = 5
     LAMBDA = 0.1
     LR = 1e-4
-    SAVE_PATH = "controlnet_dual_stage.pt"
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
-    dataset = sketch_dataset(CSV_PATH, IMAGE_ROOT)
+    dataset = SketchDataset(CSV_PATH, IMAGE_ROOT)
     dataloader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
@@ -133,7 +140,10 @@ def main():
         torch_dtype=torch.float16
     ).to(device)
 
-    diff_model.enable_xformers_memory_efficient_attention()
+    try:
+        diff_model.enable_xformers_memory_efficient_attention()
+    except:
+        print("xformers not available, continuing without it")
 
     controlnet = ControlNetModel.from_pretrained(
         "lllyasviel/sd-controlnet-scribble",
@@ -147,7 +157,6 @@ def main():
     diff_model.vae.requires_grad_(False)
     diff_model.text_encoder.requires_grad_(False)
 
-   
     region_pooler = RegionPooler().to(device)
     region_attn = RegionTextAttention().to(device)
     text_proj = nn.Linear(768, 256).to(device)
@@ -166,6 +175,7 @@ def main():
     text_encoder = diff_model.text_encoder
     vae = diff_model.vae
     unet = diff_model.unet
+
     for epoch in range(EPOCHS):
 
         epoch_diff_loss = 0
@@ -185,6 +195,7 @@ def main():
                 latents = latents * 0.18215
 
             noise = torch.randn_like(latents)
+
             t = torch.randint(
                 0,
                 scheduler.config.num_train_timesteps,
@@ -253,6 +264,7 @@ def main():
         }, f"checkpoint_epoch_{epoch+1}.pt")
 
     print("Training complete.")
+
 
 if __name__ == "__main__":
     main()
