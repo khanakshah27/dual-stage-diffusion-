@@ -32,7 +32,7 @@ with open(CAPTION_FILE, "r", encoding="utf-8") as f:
             continue
 
         if len(words) > MAX_WORDS:
-            caption = " ".join(words[:MAX_WORDS])
+            caption = " ".join(words[:MAX_WORDS]).rstrip(",:;-")
 
 
         image_path = os.path.join(IMAGE_FOLDER, image_name)
