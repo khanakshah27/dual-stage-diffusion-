@@ -252,10 +252,17 @@ def main():
             epoch_diff_loss += diffusion_loss.item()
             epoch_sem_loss += semantic_loss.item()
 
-        print(f"\nEpoch {epoch+1}/{EPOCHS}")
-        print(f"Avg Diffusion Loss: {epoch_diff_loss/len(dataloader):.4f}")
-        print(f"Avg Semantic Loss: {epoch_sem_loss/len(dataloader):.4f}")
+        steps = len(dataloader)
+        avg_diff = epoch_diff_loss / steps
+        avg_sem = epoch_sem_loss / steps
+        total = avg_diff + LAMBDA * avg_sem
 
+        print(f"\n{'='*40}")
+        print(f"Epoch {epoch+1}/{EPOCHS}")
+        print(f"Diffusion Loss (MSE):  {avg_diff:.4f}")
+        print(f"Semantic Loss:         {avg_sem:.4f}")
+        print(f"Total Loss:            {total:.4f}")
+        print(f"{'='*40}")
         torch.save({
             "controlnet": controlnet.state_dict(),
             "region_pooler": region_pooler.state_dict(),
