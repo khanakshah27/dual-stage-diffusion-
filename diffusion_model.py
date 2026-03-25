@@ -58,13 +58,13 @@ class sketch_dataset(Dataset):
         return None
 
     sketch = self.edge_sketch(img)
+    sketch = sketch.repeat(3, 1, 1)
 
-    return {
-        "image": img,
-        "sketch": sketch,
-        "text": caption
-    }
-
+        return {
+            "image": img,
+            "sketch": sketch,
+            "text": caption
+        }
 
 def collate_fn(batch):
     batch = [b for b in batch if b is not None]
@@ -79,7 +79,7 @@ def collate_fn(batch):
     }
 
 class RegionPooler(nn.Module):
-    def __init__(self, in_channels=1280, region_dim=256):htr00055thy
+    def __init__(self, in_channels=512, region_dim=256):htr00055thy
         super().__init__()
         self.proj = nn.Conv2d(in_channels, region_dim, 4, 4)
         self.norm = nn.LayerNorm(region_dim)
@@ -123,8 +123,9 @@ def main():
         batch_size=BATCH_SIZE,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4,
-        pin_memory=True
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True
     )
 
     diff_model = StableDiffusionPipeline.from_pretrained(
@@ -224,11 +225,11 @@ def main():
                 diffusion_loss = F.mse_loss(noise_pred, noise)
 
                 projected_text = text_proj(text_embeds)
-                regions = region_pooler(mid_sample)
+                regions = region_pooler(down_samples[-1].float())
                 region_out, _ = region_attn(regions, projected_text)
 
                 sim = torch.einsum("brd,btd->brt", region_out, projected_text)
-                semantic_loss = -sim.max(dim=-1)[0].mean()
+                semantic_loss = -F.normalize(sim, dim=-1).max(dim=-1)[0].mean()
 
                 total_loss = diffusion_loss + LAMBDA * semantic_loss
 
